@@ -5,15 +5,18 @@ import io.quarkus.test.junit.QuarkusTest
 import io.quarkus.test.kafka.InjectKafkaCompanion
 import io.quarkus.test.kafka.KafkaCompanionResource
 import io.restassured.RestAssured.given
-import io.smallrye.reactive.messaging.kafka.companion.ConsumerTask
+import io.smallrye.common.annotation.Identifier
 import io.smallrye.reactive.messaging.kafka.companion.KafkaCompanion
 import io.vertx.core.json.JsonObject
 import jakarta.inject.Inject
 import jakarta.transaction.Transactional
-import org.eda.ecommerce.JsonSerdeFactory
+import org.apache.kafka.clients.consumer.ConsumerRecords
+import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.eda.ecommerce.data.models.events.TestEntityEvent
 import org.eda.ecommerce.data.repositories.TestEntityRepository
+import org.eda.ecommerce.helpers.KafkaTestHelper
 import org.junit.jupiter.api.*
+import java.time.Duration
 
 
 @QuarkusTest
@@ -25,24 +28,29 @@ class TestEntityTest {
     lateinit var companion: KafkaCompanion
 
     @Inject
+    @Identifier("default-kafka-broker")
+    lateinit var kafkaConfig: Map<String, Any>
+
+    @Inject
     lateinit var testEntityRepository: TestEntityRepository
 
-    @BeforeAll
-    fun setup() {
-        val testEntityJsonSerdeFactory = JsonSerdeFactory<TestEntityEvent>()
-        companion.registerSerde(
-            TestEntityEvent::class.java,
-            testEntityJsonSerdeFactory.createSerializer(),
-            testEntityJsonSerdeFactory.createDeserializer(TestEntityEvent::class.java)
-        )
-    }
+    lateinit var consumer: KafkaConsumer<String, TestEntityEvent>
+
 
     @BeforeEach
     @Transactional
-    fun recreateTestedTopics() {
-        companion.topics().delete("test-entity")
-        companion.topics().create("test-entity", 1)
+    fun cleanRepositoryAndKafkaTopics() {
+        KafkaTestHelper.clearTopicIfNotEmpty(companion, "test-entity")
+        KafkaTestHelper.clearTopicIfNotEmpty(companion, "test-entity")
+
+        consumer = KafkaTestHelper.setupConsumer<TestEntityEvent>(kafkaConfig)
+
         testEntityRepository.deleteAll()
+    }
+
+    @AfterEach
+    fun unsubscribeConsumer() {
+        KafkaTestHelper.deleteConsumer(consumer)
     }
 
     @Test
@@ -63,6 +71,8 @@ class TestEntityTest {
 
     @Test
     fun testKafkaEmitOnPost() {
+        consumer.subscribe(listOf("test-entity"))
+
         val jsonBody: JsonObject = JsonObject()
             .put("value", "a value")
 
@@ -73,18 +83,18 @@ class TestEntityTest {
             .then()
             .statusCode(201)
 
-        val testEntityConsumer: ConsumerTask<String, TestEntityEvent> =
-            companion.consume(TestEntityEvent::class.java).fromTopics("test-entity", 1)
+        val records: ConsumerRecords<String, TestEntityEvent> = consumer.poll(Duration.ofMillis(10000))
 
-        testEntityConsumer.awaitCompletion()
+        val event = records.records("test-entity").iterator().asSequence().toList().first()
+        val eventPayload = event.value()
 
-        val testEntityResponse = testEntityConsumer.firstRecord.value()
-
-        Assertions.assertEquals(jsonBody.getValue("value"), testEntityResponse.payload.value)
+        Assertions.assertEquals(jsonBody.getValue("value"), eventPayload.payload.value)
     }
 
     @Test
     fun testDelete() {
+        consumer.subscribe(listOf("test-entity"))
+
         val jsonBody: JsonObject = JsonObject()
             .put("value", "Test")
 
@@ -107,22 +117,23 @@ class TestEntityTest {
             .then()
             .statusCode(202)
 
-        val productConsumer: ConsumerTask<String, TestEntityEvent> =
-            companion.consume(TestEntityEvent::class.java).fromTopics("test-entity", 2)
+        val records: ConsumerRecords<String, TestEntityEvent> = consumer.poll(Duration.ofMillis(10000))
 
-        productConsumer.awaitCompletion()
+        val event = records.records("test-entity").iterator().asSequence().toList()[1]
+        val eventPayload = event.value()
 
-        val event = productConsumer.records[1].value()
-        Assertions.assertEquals("test-service", event.source)
-        Assertions.assertEquals("deleted", event.type)
-        Assertions.assertEquals(createdId, event.payload.id)
-        Assertions.assertEquals(null, event.payload.value)
+        Assertions.assertEquals("test-service", eventPayload.source)
+        Assertions.assertEquals("deleted", eventPayload.type)
+        Assertions.assertEquals(createdId, eventPayload.payload.id)
+        Assertions.assertEquals(null, eventPayload.payload.value)
 
         Assertions.assertEquals(0, testEntityRepository.count())
     }
 
     @Test
     fun testUpdate() {
+        consumer.subscribe(listOf("test-entity"))
+
         val jsonBody: JsonObject = JsonObject()
             .put("value", "A thing")
 
@@ -149,16 +160,15 @@ class TestEntityTest {
             .then()
             .statusCode(202)
 
-        val productConsumer: ConsumerTask<String, TestEntityEvent> =
-            companion.consume(TestEntityEvent::class.java).fromTopics("test-entity", 2)
+        val records: ConsumerRecords<String, TestEntityEvent> = consumer.poll(Duration.ofMillis(10000))
 
-        productConsumer.awaitCompletion()
+        val event = records.records("test-entity").iterator().asSequence().toList()[1]
+        val eventPayload = event.value()
 
-        val event = productConsumer.records[1].value()
-        Assertions.assertEquals("test-service", event.source)
-        Assertions.assertEquals("updated", event.type)
-        Assertions.assertEquals(createdId, event.payload.id)
-        Assertions.assertEquals(jsonBodyUpdated.getValue("value"), event.payload.value)
+        Assertions.assertEquals("test-service", eventPayload.source)
+        Assertions.assertEquals("updated", eventPayload.type)
+        Assertions.assertEquals(createdId, eventPayload.payload.id)
+        Assertions.assertEquals(jsonBodyUpdated.getValue("value"), eventPayload.payload.value)
 
         Assertions.assertEquals(1, testEntityRepository.count())
     }
